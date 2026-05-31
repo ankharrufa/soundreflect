@@ -68,7 +68,7 @@ input[type=range]::-webkit-slider-thumb{appearance:none;width:20px;height:20px;b
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.65}}
 
 .lgnd{display:flex;flex-direction:column;gap:3px}
-.lgbar{height:14px;border-radius:7px;background:linear-gradient(to right,#000033,#0000dd,#00cccc,#00cc44,#ffcc00,#ff2200)}
+.lgbar{height:14px;border-radius:7px;background:linear-gradient(to right,#000000,#00006e,#0046c8,#00c8dc,#dcd200,#ffff78,#ffffff)}
 .lglbls{display:flex;justify-content:space-between;font-size:10px;color:#7d8590}
 
 .modes{font-size:11px;color:#7d8590;line-height:1.7}
@@ -163,7 +163,7 @@ input[type=range]::-webkit-slider-thumb{appearance:none;width:20px;height:20px;b
     <button class="simbtn" id="simbtn" onclick="runSim()">▶ SIMULATE</button>
     <div class="lgnd hidden" id="lgnd">
       <div class="lgbar"></div>
-      <div class="lglbls"><span>Null</span><span>Low</span><span>Mid</span><span>High</span><span>Peak</span></div>
+      <div class="lglbls"><span>◀ NULL (−30 dB)</span><span>MID</span><span>PEAK ▶</span></div>
     </div>
     <div class="modes hidden" id="modesInfo"></div>
   </div>
@@ -472,78 +472,80 @@ function drawSpeaker(spk, xf) {
 // ════════════════════════════════════════════
 // HEATMAP
 // ════════════════════════════════════════════
-function ampToRGBA(n) {
-  // n: 0 (null) → 1 (peak)
-  // Colormap: black → blue → cyan → green → yellow → red
-  const stops = [
-    [0,    [0,   0,  20, 0]],
-    [0.08, [0,   0, 160, 100]],
-    [0.25, [0,  60, 210, 190]],
-    [0.45, [0, 180, 180, 210]],
-    [0.62, [30, 200,  40, 220]],
-    [0.80, [230, 160,  0, 225]],
-    [1.0,  [255,  30,  0, 235]],
-  ];
-  for (let i = 0; i < stops.length - 1; i++) {
-    const [t0, c0] = stops[i], [t1, c1] = stops[i + 1];
-    if (n >= t0 && n <= t1) {
+
+// Colorblind-safe palette: pure luminance ramp, no red/green dependency.
+// Black → Dark Blue → Blue → Cyan → Yellow → White
+// Distinguishable for protanopia, deuteranopia, and tritanopia.
+const CMAP = [
+  [0.00, [  0,   0,   0]],  // black  — null / silence
+  [0.18, [  0,   0, 110]],  // dark blue
+  [0.36, [  0,  70, 200]],  // blue
+  [0.54, [  0, 200, 220]],  // cyan
+  [0.72, [220, 210,   0]],  // yellow
+  [0.88, [255, 240, 120]],  // light yellow
+  [1.00, [255, 255, 255]],  // white  — peak
+];
+
+function normToRGB(n) {
+  n = Math.max(0, Math.min(1, n));
+  for (let i = 0; i < CMAP.length - 1; i++) {
+    const [t0, c0] = CMAP[i], [t1, c1] = CMAP[i + 1];
+    if (n <= t1) {
       const t = (n - t0) / (t1 - t0);
       return [
         Math.round(c0[0] + t * (c1[0] - c0[0])),
         Math.round(c0[1] + t * (c1[1] - c0[1])),
         Math.round(c0[2] + t * (c1[2] - c0[2])),
-        Math.round(c0[3] + t * (c1[3] - c0[3])),
       ];
     }
   }
-  return [255, 30, 0, 235];
+  return CMAP[CMAP.length - 1][1];
+}
+
+// dB-scale normalizer: spreads the room-mode pattern across the full color range.
+// Uses 99th-percentile amplitude as reference so near-source hotspots don't
+// collapse the rest of the room into darkness.
+const DB_FLOOR = 30; // dB below reference that maps to colour 0 (black)
+
+function ampToNorm(amp, ref99) {
+  if (amp <= 0 || ref99 <= 0) return 0;
+  const dB = 20 * Math.log10(amp / ref99);
+  return Math.max(0, Math.min(1, (dB + DB_FLOOR) / DB_FLOOR));
 }
 
 function drawHeatmap(xf, poly) {
   const { result } = S;
   const { w: W, h: H } = S.room;
-  const { cols, rows, data, peak } = result;
+  const { cols, rows, data, ref99 } = result;
 
-  // Build ImageData
-  const offW = cols, offH = rows;
-  const imgData = ctx.createImageData(offW, offH);
+  const imgData = ctx.createImageData(cols, rows);
   const px = imgData.data;
-
-  // Build a room polygon path for checking containment
-  // We'll check point-in-polygon for each grid cell
-  // Convert polygon to canvas coords for the offscreen pixel grid
-  // Grid cell (col, row) maps to room position:
-  const dxRoom = W / (cols - 1);
-  const dyRoom = H / (rows - 1);
 
   for (let row = 0; row < rows; row++) {
     for (let col = 0; col < cols; col++) {
-      const idx = (row * cols + col);
+      const idx = row * cols + col;
       const amp = data[idx];
-      if (amp < 0) { // outside room
-        const pi = idx * 4;
+      const pi = idx * 4;
+      if (amp < 0) { // outside polygon — fully transparent
         px[pi + 3] = 0;
         continue;
       }
-      const n = peak > 0 ? amp / peak : 0;
-      const [r, g, b, a] = ampToRGBA(n);
-      const pi = idx * 4;
-      px[pi] = r; px[pi+1] = g; px[pi+2] = b; px[pi+3] = a;
+      const n = ampToNorm(amp, ref99);
+      const [r, g, b] = normToRGB(n);
+      px[pi] = r; px[pi + 1] = g; px[pi + 2] = b;
+      px[pi + 3] = 255; // always fully opaque inside room
     }
   }
 
-  // Draw onto a temporary canvas scaled to room area
   const tmp = document.createElement('canvas');
-  tmp.width = offW; tmp.height = offH;
-  const tctx = tmp.getContext('2d');
-  tctx.putImageData(imgData, 0, 0);
+  tmp.width = cols; tmp.height = rows;
+  tmp.getContext('2d').putImageData(imgData, 0, 0);
 
-  // Map: grid corners → canvas coords
-  const { cx: x0, cy: y1 } = r2c(0, H, xf); // top-left in canvas (high y = top in room)
-  const { cx: x1, cy: y0 } = r2c(W, 0, xf); // bottom-right in canvas
+  const { cx: x0, cy: y1 } = r2c(0, H, xf); // canvas top-left of room area
+  const { cx: x1, cy: y0 } = r2c(W, 0, xf); // canvas bottom-right
   const dw = x1 - x0, dh = y0 - y1;
 
-  // Clip to room polygon
+  // Clip to room polygon so features / non-rectangular shapes are respected
   ctx.save();
   ctx.beginPath();
   let first = true;
@@ -555,22 +557,8 @@ function drawHeatmap(xf, poly) {
   ctx.closePath();
   ctx.clip();
 
-  // Negative dh flips the image vertically: row 0 (room y=0) → canvas bottom, row N (room y=H) → canvas top
+  // Negative dh flips vertically: simulation row 0 (y=0, floor) → canvas bottom
   ctx.drawImage(tmp, x0, y0, dw, -dh);
-  ctx.restore();
-
-  // Overlay subtle room fill tint on top for room visibility
-  ctx.save();
-  ctx.beginPath();
-  first = true;
-  for (const p of poly) {
-    const { cx, cy } = r2c(p.x, p.y, xf);
-    first ? ctx.moveTo(cx, cy) : ctx.lineTo(cx, cy);
-    first = false;
-  }
-  ctx.closePath();
-  ctx.fillStyle = 'rgba(0,0,0,0.08)';
-  ctx.fill();
   ctx.restore();
 }
 
@@ -647,7 +635,7 @@ function simulate() {
   const dy = H / (rows - 1);
 
   const data = new Float32Array(cols * rows);
-  let peak = 0;
+  const positive = []; // collect amplitudes for percentile calculation
 
   for (let row = 0; row < rows; row++) {
     const py = row * dy;
@@ -671,11 +659,16 @@ function simulate() {
 
       const amp = Math.sqrt(re * re + im * im);
       data[row * cols + col] = amp;
-      if (amp > peak) peak = amp;
+      positive.push(amp);
     }
   }
 
-  S.result = { data, peak, cols, rows, dx, dy };
+  // 99th-percentile reference: clips the near-source hotspot so the
+  // room-mode interference pattern fills the full colour range.
+  positive.sort((a, b) => a - b);
+  const ref99 = positive[Math.floor(positive.length * 0.99)] || 1;
+
+  S.result = { data, ref99, cols, rows, dx, dy };
 }
 
 // ════════════════════════════════════════════
@@ -818,7 +811,7 @@ function showTapInfo(rx, ry, cx, cy) {
   const clampedRow = Math.max(0, Math.min(result.rows - 1, row));
   const amp = result.data[clampedRow * result.cols + clampedCol];
   if (amp < 0) return;
-  const dB = amp > 0 ? 20 * Math.log10(amp / result.peak) : -Infinity;
+  const dB = amp > 0 ? 20 * Math.log10(amp / result.ref99) : -Infinity;
   const el = document.getElementById('tapinfo');
   el.style.display = 'block';
   el.style.left = Math.min(cW() - 120, cx + 10) + 'px';
